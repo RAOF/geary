@@ -89,6 +89,7 @@ class ImapConsole : Gtk.Window {
         "unsecure",
         "disconnect",
         "login",
+        "authenticate",
         "logout",
         "id",
         "bye",
@@ -155,6 +156,10 @@ class ImapConsole : Gtk.Window {
                     
                     case "starttls":
                         starttls(cmd, args);
+                    break;
+
+                    case "authenticate":
+                        authenticate(cmd, args);
                     break;
                     
                     case "login":
@@ -396,6 +401,36 @@ class ImapConsole : Gtk.Window {
         try {
             cx.send_async.end(result);
             status("Login completed");
+        } catch (Error err) {
+            exception(err);
+        }
+    }
+
+    private void authenticate(string cmd, string[] args) throws Error {
+        check_connected (cmd, args, 2, "method secret");
+
+        status("Authenticating...");
+        do_authenticate_async.begin(args[0], args[1], on_authenticated);
+    }
+
+    private string send_empty_continuation_response(Geary.Imap.ContinuationResponse challenge)
+    {
+        return "+";
+    }
+        
+    private async void do_authenticate_async(string method, string secret) throws Error {
+        var cmd = new Geary.Imap.AuthenticateCommand(method, secret);
+        cx.received_authentication_challenge.connect_after(send_empty_continuation_response);
+
+        yield cx.authenticate_async(cmd);
+        yield wait_for_response_async(cmd.tag);
+    }
+    
+    private void on_authenticated(Object? source, AsyncResult result) {
+        try {
+            cx.authenticate_async.end(result);
+            status("Authentication completed");
+                
         } catch (Error err) {
             exception(err);
         }

@@ -38,6 +38,7 @@ public class Geary.Imap.ClientConnection : BaseObject {
     private enum State {
         UNCONNECTED,
         CONNECTED,
+        AUTHENTICATING,
         IDLING,
         IDLE,
         DEIDLING,
@@ -63,6 +64,9 @@ public class Geary.Imap.ClientConnection : BaseObject {
         
         // To initiate a command continuation request
         SYNCHRONIZE,
+
+        // To initiate the authentication dance
+        AUTHENTICATE,
         
         // RECVD_* will emit appropriate signals inside their transition handlers; do *not* use
         // issue_conditional_event() for these events
@@ -163,9 +167,14 @@ public class Geary.Imap.ClientConnection : BaseObject {
     public virtual signal void received_continuation_response(ContinuationResponse continuation_response) {
         Logging.debug(Logging.Flag.NETWORK, "[%s R] %s", to_string(), continuation_response.to_string());
     }
+
+    public virtual signal string received_authentication_challenge(ContinuationResponse challenge) {
+        Logging.debug(Logging.Flag.NETWORK, "[%s R] %s", to_string(), challenge.to_string());
+        return "*";
+    }
     
     public virtual signal void received_bytes(size_t bytes) {
-        // this generates a *lot* of debug logging if one was placed here, so it's not
+        Logging.debug(Logging.Flag.NETWORK, "[%s R] %i bytes", to_string(), bytes);
     }
     
     public virtual signal void received_bad_response(RootParameters root, ImapError err) {
@@ -201,7 +210,8 @@ public class Geary.Imap.ClientConnection : BaseObject {
         Geary.State.Mapping[] mappings = {
             new Geary.State.Mapping(State.UNCONNECTED, Event.CONNECTED, on_connected),
             new Geary.State.Mapping(State.UNCONNECTED, Event.DISCONNECTED, on_disconnected),
-            
+
+            new Geary.State.Mapping(State.CONNECTED, Event.AUTHENTICATE, on_proceed),
             new Geary.State.Mapping(State.CONNECTED, Event.SEND, on_proceed),
             new Geary.State.Mapping(State.CONNECTED, Event.SEND_IDLE, on_send_idle),
             new Geary.State.Mapping(State.CONNECTED, Event.SYNCHRONIZE, on_synchronize),
@@ -210,6 +220,11 @@ public class Geary.Imap.ClientConnection : BaseObject {
             new Geary.State.Mapping(State.CONNECTED, Event.RECVD_CONTINUATION_RESPONSE, on_continuation),
             new Geary.State.Mapping(State.CONNECTED, Event.DISCONNECTED, on_disconnected),
             
+            new Geary.State.Mapping(State.AUTHENTICATING, Event.RECVD_CONTINUATION_RESPONSE, on_authentication_challenge),
+            new Geary.State.Mapping(State.AUTHENTICATING, Event.RECVD_SERVER_DATA, on_server_data),
+            new Geary.State.Mapping(State.AUTHENTICATING, Event.RECVD_STATUS_RESPONSE, on_authentication_done),
+            new Geary.State.Mapping(State.AUTHENTICATING, Event.DISCONNECTED, on_disconnected),
+
             new Geary.State.Mapping(State.IDLING, Event.SEND, on_idle_send),
             new Geary.State.Mapping(State.IDLING, Event.SEND_IDLE, on_no_proceed),
             new Geary.State.Mapping(State.IDLING, Event.SYNCHRONIZE, on_idle_synchronize),
@@ -257,6 +272,7 @@ public class Geary.Imap.ClientConnection : BaseObject {
             // subscribers before moving to the DISCONNECTED state.  That would require more work,
             // allowing for the caller (ClientSession) to close the receive channel and wait for
             // everything to flush out before it shifted to a DISCONNECTED state as well.
+            new Geary.State.Mapping(State.DISCONNECTED, Event.AUTHENTICATE, on_no_proceed),
             new Geary.State.Mapping(State.DISCONNECTED, Event.SEND, on_no_proceed),
             new Geary.State.Mapping(State.DISCONNECTED, Event.SEND_IDLE, on_no_proceed),
             new Geary.State.Mapping(State.DISCONNECTED, Event.SYNCHRONIZE, on_no_proceed),
@@ -606,6 +622,53 @@ public class Geary.Imap.ClientConnection : BaseObject {
         // by this signal, will want to tighten this up a bit in the future
         sent_command(cmd);
     }
+
+    public async void authenticate_async(AuthenticateCommand cmd, Cancellable? cancellable = null) throws Error {
+        check_for_connection();
+        
+        if (!issue_conditional_event(Event.AUTHENTICATE)) {
+            debug("[%s] Authenticate async not allowed", to_string());
+            
+            throw new ImapError.NOT_CONNECTED("Authenticate not allowed: connection in %s state",
+                fsm.get_state_string(fsm.get_state()));
+        }
+        // need to run this in critical section because Serializer requires it (don't want to be
+        // pushing data while a flush_async() is occurring)
+        int token = yield send_mutex.claim_async(cancellable);
+        
+        // Always assign a new tag; Commands with pre-assigned Tags should not be re-sent.
+        // (Do this inside the critical section to ensure commands go out in Tag order; this is not
+        // an IMAP requirement but makes tracing commands easier.)
+        cmd.assign_tag(generate_tag());
+        
+        // set the timeout on this command; note that a zero-second timeout means no timeout,
+        // and that there's no timeout on serialization
+        cmd_started_timeout();
+        
+        Error? ser_err = null;
+        try {
+            // watch for disconnect while waiting for mutex
+            if (ser != null) {
+                cmd.serialize(ser, cmd.tag);
+            } else {
+                ser_err = new ImapError.NOT_CONNECTED("Send not allowed: connection in %s state",
+                    fsm.get_state_string(fsm.get_state()));
+            }
+        } catch (Error err) {
+            debug("[%s] Error serializing command: %s", to_string(), err.message);
+            ser_err = err;
+        }
+
+        send_mutex.release(ref token);
+        
+        if (ser_err != null) {
+            send_failure(ser_err);
+            
+            throw ser_err;
+        }
+
+        sent_command (cmd);
+    }
     
     private void reschedule_flush_timeout() {
         unschedule_flush_timeout();
@@ -843,6 +906,18 @@ public class Geary.Imap.ClientConnection : BaseObject {
     private void signal_continuation(void *user, Object? object) {
         received_continuation_response((ContinuationResponse) object);
     }
+
+    private void signal_auth_challenge(void *user, Object? object) {
+        increase_timeout ();
+        var response = received_authentication_challenge((ContinuationResponse) object);
+        try {
+        ser.push_quoted_string(response);
+        ser.push_eol();
+        ser.push_end_of_message();
+        } catch (Error e)
+        {
+        }
+    }
     
     private void signal_entered_idle() {
         in_idle(true);
@@ -928,6 +1003,16 @@ public class Geary.Imap.ClientConnection : BaseObject {
         
         return state;
     }
+
+    private uint on_authentication_challenge(uint state, uint event, void *user, Object? object) {
+        fsm.do_post_transition(signal_auth_challenge, user, object);
+        
+        return state;
+    }
+
+    private uint on_authentication_done(uint state, uint event, void *user, Object? object) {
+        return State.CONNECTED;
+    }    
     
     private uint on_idling_continuation(uint state, uint event, void *user, Object? object) {
         ContinuationResponse continuation = (ContinuationResponse) object;

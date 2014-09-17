@@ -5,13 +5,13 @@
  */
 
 /**
- * A representation of the IMAP APPEND command.
+ * A representation of the IMAP AUTHENTICATE command.
  *
  * See [[http://tools.ietf.org/html/rfc3501#section-6.3.11]]
  */
 
 public class Geary.Imap.AppendCommand : Command {
-    public const string NAME = "append";
+    public const string NAME = "AUTHENTICATE";
     
     public AppendCommand(MailboxSpecifier mailbox, MessageFlags? flags, InternalDate? internal_date,
         Memory.Buffer message) {

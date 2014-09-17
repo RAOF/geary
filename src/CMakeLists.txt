@@ -89,6 +89,7 @@ engine/imap/api/imap-folder-properties.vala
 engine/imap/api/imap-folder.vala
 engine/imap/api/imap-folder-root.vala
 engine/imap/command/imap-append-command.vala
+engine/imap/command/imap-authenticate-command.vala
 engine/imap/command/imap-capability-command.vala
 engine/imap/command/imap-close-command.vala
 engine/imap/command/imap-command.vala
