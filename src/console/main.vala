@@ -415,14 +415,16 @@ class ImapConsole : Gtk.Window {
 
     private string send_empty_continuation_response(Geary.Imap.ContinuationResponse challenge)
     {
-        return "+";
+        append_to_console ("[Debug] Sending authentication response");
+        return "+\r\n";
     }
         
     private async void do_authenticate_async(string method, string secret) throws Error {
         var cmd = new Geary.Imap.AuthenticateCommand(method, secret);
         cx.received_authentication_challenge.connect_after(send_empty_continuation_response);
-
+        append_to_console ("[DEBUG] Starting async authentication\n");
         yield cx.authenticate_async(cmd);
+        append_to_console ("[DEBUG] Waiting for response...\n");
         yield wait_for_response_async(cmd.tag);
     }
     

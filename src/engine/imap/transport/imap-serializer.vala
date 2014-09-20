@@ -189,7 +189,8 @@ public class Geary.Imap.Serializer : BaseObject {
     public async void flush_async(bool is_synchronized, out Tag? synchronize_tag,
         Cancellable? cancellable = null) throws Error {
         synchronize_tag = null;
-        
+
+        debug("Flushing...");
         // commit the last buffer to the queue (although this is best done with push_end_message)
         enqueue_current_stream();
         
@@ -203,6 +204,7 @@ public class Geary.Imap.Serializer : BaseObject {
                 synchronize_tag = data.literal_data_tag;
                 
                 // break out to ensure pipe is flushed
+                debug("Have synchronised data, but not synchronised, breaking");
                 break;
             }
             

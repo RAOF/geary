@@ -170,7 +170,7 @@ public class Geary.Imap.ClientConnection : BaseObject {
 
     public virtual signal string received_authentication_challenge(ContinuationResponse challenge) {
         Logging.debug(Logging.Flag.NETWORK, "[%s R] %s", to_string(), challenge.to_string());
-        return "*";
+        return "*\r\n";
     }
     
     public virtual signal void received_bytes(size_t bytes) {
@@ -211,7 +211,7 @@ public class Geary.Imap.ClientConnection : BaseObject {
             new Geary.State.Mapping(State.UNCONNECTED, Event.CONNECTED, on_connected),
             new Geary.State.Mapping(State.UNCONNECTED, Event.DISCONNECTED, on_disconnected),
 
-            new Geary.State.Mapping(State.CONNECTED, Event.AUTHENTICATE, on_proceed),
+            new Geary.State.Mapping(State.CONNECTED, Event.AUTHENTICATE, on_authenticating),
             new Geary.State.Mapping(State.CONNECTED, Event.SEND, on_proceed),
             new Geary.State.Mapping(State.CONNECTED, Event.SEND_IDLE, on_send_idle),
             new Geary.State.Mapping(State.CONNECTED, Event.SYNCHRONIZE, on_synchronize),
@@ -222,7 +222,7 @@ public class Geary.Imap.ClientConnection : BaseObject {
             
             new Geary.State.Mapping(State.AUTHENTICATING, Event.RECVD_CONTINUATION_RESPONSE, on_authentication_challenge),
             new Geary.State.Mapping(State.AUTHENTICATING, Event.RECVD_SERVER_DATA, on_server_data),
-            new Geary.State.Mapping(State.AUTHENTICATING, Event.RECVD_STATUS_RESPONSE, on_authentication_done),
+            new Geary.State.Mapping(State.AUTHENTICATING, Event.RECVD_STATUS_RESPONSE, on_status_response),
             new Geary.State.Mapping(State.AUTHENTICATING, Event.DISCONNECTED, on_disconnected),
 
             new Geary.State.Mapping(State.IDLING, Event.SEND, on_idle_send),
@@ -516,6 +516,8 @@ public class Geary.Imap.ClientConnection : BaseObject {
     
     private void on_parameters_ready(RootParameters root) {
         ServerResponse response;
+        debug("Yo! Got some parameters fresh off the block:");
+        debug(root.to_string());
         try {
             response = ServerResponse.migrate_from_server(root);
         } catch (ImapError err) {
@@ -526,6 +528,7 @@ public class Geary.Imap.ClientConnection : BaseObject {
         
         StatusResponse? status_response = response as StatusResponse;
         if (status_response != null) {
+            debug("It's a StatusResponse, yo");
             fsm.issue(Event.RECVD_STATUS_RESPONSE, null, status_response);
             
             return;
@@ -533,6 +536,7 @@ public class Geary.Imap.ClientConnection : BaseObject {
         
         ServerData? server_data = response as ServerData;
         if (server_data != null) {
+            debug("It's just server data");
             fsm.issue(Event.RECVD_SERVER_DATA, null, server_data);
             
             return;
@@ -540,6 +544,7 @@ public class Geary.Imap.ClientConnection : BaseObject {
         
         ContinuationResponse? continuation_response = response as ContinuationResponse;
         if (continuation_response != null) {
+                        debug("Continuatron!");
             fsm.issue(Event.RECVD_CONTINUATION_RESPONSE, null, continuation_response);
             
             return;
@@ -625,13 +630,16 @@ public class Geary.Imap.ClientConnection : BaseObject {
 
     public async void authenticate_async(AuthenticateCommand cmd, Cancellable? cancellable = null) throws Error {
         check_for_connection();
-        
+        debug("Yo! Actually doing stuff!\n");
         if (!issue_conditional_event(Event.AUTHENTICATE)) {
             debug("[%s] Authenticate async not allowed", to_string());
             
             throw new ImapError.NOT_CONNECTED("Authenticate not allowed: connection in %s state",
                 fsm.get_state_string(fsm.get_state()));
         }
+
+        debug("Yo! We're now in state:");
+        debug(fsm.get_state_string(fsm.get_state()));
         // need to run this in critical section because Serializer requires it (don't want to be
         // pushing data while a flush_async() is occurring)
         int token = yield send_mutex.claim_async(cancellable);
@@ -649,6 +657,7 @@ public class Geary.Imap.ClientConnection : BaseObject {
         try {
             // watch for disconnect while waiting for mutex
             if (ser != null) {
+        debug("Serializing...\n");
                 cmd.serialize(ser, cmd.tag);
             } else {
                 ser_err = new ImapError.NOT_CONNECTED("Send not allowed: connection in %s state",
@@ -667,6 +676,8 @@ public class Geary.Imap.ClientConnection : BaseObject {
             throw ser_err;
         }
 
+        reschedule_flush_timeout();
+        
         sent_command (cmd);
     }
     
@@ -904,18 +915,22 @@ public class Geary.Imap.ClientConnection : BaseObject {
     }
     
     private void signal_continuation(void *user, Object? object) {
+        debug("Yo, continuation");
         received_continuation_response((ContinuationResponse) object);
     }
 
     private void signal_auth_challenge(void *user, Object? object) {
+        debug("Yo, auth challenge");
         increase_timeout ();
         var response = received_authentication_challenge((ContinuationResponse) object);
+        debug("Hello! I'm planning to return: ");
+        debug(response);
         try {
-        ser.push_quoted_string(response);
-        ser.push_eol();
-        ser.push_end_of_message();
+            ser.push_synchronized_literal_data(generate_tag(), new Memory.StringBuffer(response));
+            ser.flush_async.begin(true, null);
         } catch (Error e)
         {
+            debug("I DIE!");
         }
     }
     
@@ -946,7 +961,7 @@ public class Geary.Imap.ClientConnection : BaseObject {
     private uint on_no_proceed(uint state, uint event, void *user) {
         return do_no_proceed(state, user);
     }
-    
+
     private uint on_connected(uint state, uint event, void *user) {
         // don't stay in connected state if IDLE is to be used; schedule an IDLE command (which
         // may be rescheduled if commands immediately start being issued, which they most likely
@@ -955,6 +970,10 @@ public class Geary.Imap.ClientConnection : BaseObject {
             reschedule_flush_timeout();
         
         return State.CONNECTED;
+    }
+    
+    private uint on_authenticating(uint state, uint event, void *user) {
+        return do_proceed(State.AUTHENTICATING, user);
     }
     
     private uint on_disconnected(uint state, uint event, void *user) {
@@ -1010,9 +1029,9 @@ public class Geary.Imap.ClientConnection : BaseObject {
         return state;
     }
 
-    private uint on_authentication_done(uint state, uint event, void *user, Object? object) {
-        return State.CONNECTED;
-    }    
+//    private uint on_authentication_done(uint state, uint event, void *user, Object? object) {
+//        return State.CONNECTED;
+//    }    
     
     private uint on_idling_continuation(uint state, uint event, void *user, Object? object) {
         ContinuationResponse continuation = (ContinuationResponse) object;
